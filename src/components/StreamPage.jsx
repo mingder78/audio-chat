@@ -79,6 +79,30 @@ function StreamPage() {
   const [manualConnectMsg, setManualConnectMsg] = useState("");
   const [connectionsSnapshot, setConnectionsSnapshot] = useState([]);
 
+  	// Add closeMsg function
+	const closeMsg = () => {
+		setSnackbar({ ...snackbar, open: false })
+	}
+  const [connectionType, setConnectionType] = useState('webrtc') // 'webrtc' | 'libp2p-protocol'
+	
+  	// Stream health monitoring
+	const lastFrameTimeRef = useRef(Date.now());
+	const chunkQueueRef = useRef([]);
+	const isProcessingQueueRef = useRef(false);
+	const streamHealthIntervalRef = useRef(null);
+	const recoveryStateRef = useRef({
+		isRequestingInit: false,
+		isRestartingICE: false,
+		isReconnecting: false,
+	});
+
+  const [streamHealth, setStreamHealth] = useState({
+		framesReceived: 0,
+		lastFrameTime: 0,
+		isStalled: false,
+		bufferHealth: 'unknown'
+	})
+
   const mediaRecorderRef = useRef(null);
   const initSegmentRef = useRef(null); // first segment (init) to replay to late-joiners
   const localStreamRef = useRef(null);
@@ -157,6 +181,513 @@ function StreamPage() {
 		setBroadcasting(false)
 		showMsg('Broadcast stopped', 'info')
 	}
+
+  	const resetRecoveryState = () => {
+		recoveryStateRef.current = {
+			isRequestingInit: false,
+			isRestartingICE: false,
+			isReconnecting: false,
+		};
+	};
+
+  // Reset MediaSource pipeline when SourceBuffer becomes invalid
+	const resetMediaSourcePipeline = useCallback(() => {
+		try {
+			console.log('[STREAM][RESET] Resetting MediaSource pipeline')
+			
+			// Clear timeouts
+			if (mediaSourceResetTimeoutRef.current) {
+				clearTimeout(mediaSourceResetTimeoutRef.current)
+				mediaSourceResetTimeoutRef.current = null
+			}
+			
+			// Store current pending buffers to early buffers
+			if (pendingBuffersRef.current.length > 0) {
+				earlyBuffersRef.current.push(...pendingBuffersRef.current)
+				pendingBuffersRef.current = []
+			}
+			
+			// Clean up current MediaSource
+			if (sourceBufferRef.current) {
+				sourceBufferRef.current = null
+			}
+			
+			if (mediaSourceRef.current) {
+				try {
+					if (mediaSourceRef.current.readyState === 'open') {
+						console.log('[STREAM][RESET] (skip endOfStream to avoid premature close)')
+						// intentionally NOT calling endOfStream here to prevent auto-closing during active playback
+					}
+				} catch (e) { /* ignore */ }
+				mediaSourceRef.current = null
+			}
+			
+			if (videoRemoteRef.current) {
+				try {
+					URL.revokeObjectURL(videoRemoteRef.current.src)
+					videoRemoteRef.current.src = ''
+				} catch (e) { /* ignore */ }
+			}
+			
+			// Reset flags
+			firstRemoteFrameRef.current = false
+			
+			// Re-setup MediaSource if we have a mimeType
+			if (mimeType) {
+				setTimeout(() => {
+					console.log('[STREAM][RESET] Re-setting up MediaSource after reset')
+					if (!('MediaSource' in window)) {
+						console.error('[STREAM][RESET] MediaSource API not supported')
+						return
+					}
+					
+					const ms = new MediaSource()
+					mediaSourceRef.current = ms
+					videoRemoteRef.current.src = URL.createObjectURL(ms)
+					
+					ms.addEventListener('sourceopen', () => {
+						try {
+							if (ms !== mediaSourceRef.current || ms.readyState !== 'open') {
+								console.warn('[STREAM][RESET] MediaSource state changed during reset sourceopen')
+								return
+							}
+							
+							const sb = ms.addSourceBuffer(mimeType)
+							console.log('[STREAM][RESET] SourceBuffer recreated with mimeType=', mimeType)
+							
+							sourceBufferRef.current = sb
+							sb.mode = 'sequence'
+							
+							// Re-attach event listeners
+							sb.addEventListener('updateend', () => {
+								const currentSb = sourceBufferRef.current
+								const currentMs = mediaSourceRef.current
+								
+								if (!currentSb || !currentMs || currentMs.readyState !== 'open' || !Array.from(currentMs.sourceBuffers).includes(currentSb)) {
+									return
+								}
+								
+								if (pendingBuffersRef.current.length > 0 && !currentSb.updating) {
+									const next = pendingBuffersRef.current.shift()
+									if (next) {
+										try {
+											currentSb.appendBuffer(next)
+										} catch (e) {
+											console.error('[STREAM][RESET UPDATEEND] Failed to append buffer', e)
+										}
+									}
+								}
+								
+								if (!firstRemoteFrameRef.current && videoRemoteRef.current && videoRemoteRef.current.readyState >= 2) {
+									firstRemoteFrameRef.current = true
+									videoRemoteRef.current.play().catch(()=>{})
+								}
+							})
+							
+							// Process early buffers
+							if (earlyBuffersRef.current.length) {
+								console.log('[STREAM][RESET] Processing early buffers count=', earlyBuffersRef.current.length)
+								while (earlyBuffersRef.current.length) {
+									const buf = earlyBuffersRef.current.shift()
+									try {
+										if (!sb.updating && ms.readyState === 'open') {
+											sb.appendBuffer(buf)
+										} else {
+											pendingBuffersRef.current.push(buf)
+										}
+									} catch (e) { 
+										console.error('[STREAM][RESET] Failed to append early buffer', e)
+										pendingBuffersRef.current.push(buf)
+									}
+								}
+							}
+						} catch (err) {
+							console.error('[STREAM][RESET] Error setting up reset SourceBuffer', err)
+						}
+					})
+				}, 100)
+			}
+			
+		} catch (e) {
+			console.error('[STREAM][RESET] Error during MediaSource reset', e)
+		}
+	}, [mimeType])
+
+	const appendChunk = useCallback((newChunk) => {
+		// If a new chunk is provided, add it to the queue
+		if (newChunk) {
+			chunkQueueRef.current.push(newChunk);
+			console.log('[STREAM][QUEUE] Added chunk to queue, queue length:', chunkQueueRef.current.length);
+		}
+
+		// Process the queue
+		if (isProcessingQueueRef.current || chunkQueueRef.current.length === 0) {
+			return;
+		}
+		isProcessingQueueRef.current = true;
+
+		const chunk = chunkQueueRef.current.shift();
+		console.log('[STREAM][APPEND] Processing chunk from queue, remaining:', chunkQueueRef.current.length);
+		// If SourceBuffer not ready yet, stash as early buffer and retry shortly
+		const sbReady = () => {
+			const ms = mediaSourceRef.current
+			const sb = sourceBufferRef.current
+			return ms && sb && ms.readyState === 'open' && Array.from(ms.sourceBuffers).includes(sb) && !sb.updating
+		}
+		if (!sbReady()) {
+			// Stash ALL early chunks until SourceBuffer exists; preserves ordering
+			try { earlyBuffersRef.current.push(chunk) } catch {}
+			lastFrameTimeRef.current = Date.now(); // treat as received to avoid false stall
+			console.log('[STREAM][APPEND DEFERRING] Stashed early chunk; earlyBuffers length=', earlyBuffersRef.current.length)
+			isProcessingQueueRef.current = false
+			setTimeout(() => appendChunk(), 120)
+			return
+		}
+		try {
+			sourceBufferRef.current.appendBuffer(chunk);
+			console.log('[STREAM][APPEND] Successfully appended chunk, size:', chunk.byteLength, 'bytes');
+			
+			// Update health stats immediately after successful append call
+			lastFrameTimeRef.current = Date.now();
+			resetRecoveryState(); // A successful append resets all recovery stages
+			framesReceivedRef.current += 1
+			setStreamHealth(prev => {
+				const newFramesReceived = prev.framesReceived + 1;
+				const buffer = sourceBufferRef.current;
+				const bufferLength = buffer.buffered.length > 0 ? buffer.buffered.end(0) - buffer.buffered.start(0) : 0;
+				const bufferHealth = bufferLength > 2 ? 'healthy' : bufferLength > 0.5 ? 'low' : 'critical';
+				console.log('[STREAM][HEALTH] Buffer health:', bufferHealth, 'buffer length:', bufferLength, 'frames:', newFramesReceived);
+				return {
+					...prev,
+					framesReceived: newFramesReceived,
+					lastFrameTime: Date.now(),
+					isStalled: false,
+					bufferHealth
+				};
+			});
+			
+			// Try to play video if it's not already playing
+			if (videoRemoteRef.current && videoRemoteRef.current.paused && videoRemoteRef.current.readyState >= 2) {
+				console.log('[STREAM][PLAY] Attempting to play video - readyState:', videoRemoteRef.current.readyState);
+				videoRemoteRef.current.play().then(() => {
+					console.log('[STREAM][PLAY] Video play() resolved successfully');
+				}).catch(e => {
+					console.error('[STREAM][PLAY] Video play() failed:', e);
+				});
+			}
+		} catch (e) {
+			console.error('[STREAM][APPEND ERR] appendBuffer failed', e)
+			
+			// If SourceBuffer was removed, reset the media pipeline
+			if (e.name === 'InvalidStateError' && e.message.includes('removed from the parent media source')) {
+				console.warn('[STREAM][APPEND ERR] SourceBuffer removed, resetting MediaSource pipeline')
+				resetMediaSourcePipeline()
+				return
+			}
+			
+			// If append fails for other reasons, push chunk back to pending and try a single retry after a short delay
+			pendingBuffersRef.current.unshift(chunk)
+			setTimeout(() => {
+				try {
+					const sb2 = sourceBufferRef.current
+					const ms2 = mediaSourceRef.current
+					if (sb2 && ms2 && ms2.readyState === 'open' && Array.from(ms2.sourceBuffers).includes(sb2) && !sb2.updating && pendingBuffersRef.current.length > 0) {
+						const nxt = pendingBuffersRef.current.shift()
+						if (nxt) sb2.appendBuffer(nxt)
+					}
+				} catch (e2) { console.error('[STREAM][APPEND RETRY ERR]', e2) }
+			}, 400)
+		} finally {
+			isProcessingQueueRef.current = false;
+			// Process the next chunk in the queue if available
+			if (chunkQueueRef.current.length > 0) {
+				setTimeout(() => appendChunk(), 0); // Use setTimeout to avoid deep recursion
+			}
+		}
+	}, [resetMediaSourcePipeline])
+
+	// Extract updateend handler for proper cleanup  
+	const handleUpdateEnd = useCallback(() => {
+		const sb = sourceBufferRef.current
+		const ms = mediaSourceRef.current
+		
+		// Validate state before processing pending buffers
+		if (!sb || !ms || ms.readyState !== 'open' || !Array.from(ms.sourceBuffers).includes(sb)) {
+			if (debugLogRef.current) console.warn('[STREAM][UPDATEEND] Invalid state, skipping pending buffer processing')
+			return
+		}
+		
+		if (pendingBuffersRef.current.length > 0 && !sb.updating) {
+			const next = pendingBuffersRef.current.shift()
+			if (next) {
+				try {
+					sb.appendBuffer(next)
+				} catch (e) {
+					console.error('[STREAM][UPDATEEND] Failed to append next buffer', e)
+					if (e.name === 'InvalidStateError' && e.message.includes('removed from the parent media source')) {
+						resetMediaSourcePipeline()
+					}
+				}
+			}
+		}
+		
+		try { 
+			console.log('[STREAM][MSE] updateend; buffered=', sb.buffered.length ? sb.buffered.end(0) - sb.buffered.start(0) : 0, 'pending=', pendingBuffersRef.current.length) 
+		} catch(e) {}
+		
+		if (!firstRemoteFrameRef.current && videoRemoteRef.current && videoRemoteRef.current.readyState >= 2) {
+			firstRemoteFrameRef.current = true
+			videoRemoteRef.current.play().catch(()=>{})
+		}
+	}, [resetMediaSourcePipeline])
+
+  	// helper to request a fresh init segment (keyframe) from broadcaster
+	const requestInit = useCallback((reason='manual') => {
+		try {
+			const lp = libp2pState
+			if (!lp) return
+			const msg = { type: 'request-init', ts: Date.now(), from: lp.peerId.toString(), reason }
+			lp.services.pubsub.publish(topicName, new TextEncoder().encode(JSON.stringify(msg))).catch(()=>{})
+			if (debugLogRef.current) console.log('[STREAM][REQUEST INIT]', reason)
+		} catch (e) { console.warn('[STREAM][REQUEST INIT ERROR]', e) }
+	}, [libp2pState, topicName])
+
+  	// WebRTC functions
+	const createPeerConnection = async (peerId) => {
+		try {
+			const pc = new RTCPeerConnection(RTC_CONFIG)
+			
+			// Handle ICE candidates
+			pc.onicecandidate = (event) => {
+				if (event.candidate) {
+					sendSignalingMessage(peerId, {
+						type: 'ice-candidate',
+						candidate: event.candidate
+					})
+				}
+			}
+			
+			// Handle connection state changes
+			pc.onconnectionstatechange = () => {
+				console.log(`[WEBRTC] Connection state for ${peerId}: ${pc.connectionState}`)
+			}
+			
+			peerConnectionsRef.current.set(peerId, pc)
+			return pc
+		} catch (e) {
+			console.error('[WEBRTC] Failed to create peer connection', e)
+			return null
+		}
+	}
+	
+	const sendSignalingMessage = (peerId, message) => {
+		try {
+			const lp = libp2pState
+			if (!lp) return
+			
+			const signalingMsg = {
+				type: 'webrtc-signaling',
+				from: lp.peerId.toString(),
+				to: peerId,
+				message: message,
+				ts: Date.now()
+			}
+			
+			lp.services.pubsub.publish(topicName, new TextEncoder().encode(JSON.stringify(signalingMsg))).catch(()=>{})
+		} catch (e) {
+			console.warn('[WEBRTC] Failed to send signaling message', e)
+		}
+	}
+	
+	const handleSignalingMessage = async (msg) => {
+		try {
+			const parsed = JSON.parse(new TextDecoder().decode(msg.data))
+			if (parsed.type !== 'webrtc-signaling' || parsed.to !== libp2pState?.peerId?.toString()) {
+				return
+			}
+			
+			const peerId = parsed.from
+			let pc = peerConnectionsRef.current.get(peerId)
+			
+			if (!pc) {
+				pc = await createPeerConnection(peerId)
+				if (!pc) return
+			}
+			
+			const signalingMsg = parsed.message
+			
+			if (signalingMsg.type === 'offer') {
+				await pc.setRemoteDescription(new RTCSessionDescription(signalingMsg))
+				const answer = await pc.createAnswer()
+				await pc.setLocalDescription(answer)
+				sendSignalingMessage(peerId, {
+					type: 'answer',
+					sdp: answer.sdp
+				})
+			} else if (signalingMsg.type === 'answer') {
+				await pc.setRemoteDescription(new RTCSessionDescription(signalingMsg))
+			} else if (signalingMsg.type === 'ice-candidate') {
+				await pc.addIceCandidate(new RTCIceCandidate(signalingMsg.candidate))
+			}
+		} catch (e) {
+			console.error('[WEBRTC] Failed to handle signaling message', e)
+		}
+	}
+	
+	// Add initiateWebRTCConnection function
+	const initiateWebRTCConnection = async (targetPeerId) => {
+		try {
+			console.log('[WEBRTC] Initiating connection to', targetPeerId)
+			const pc = await createPeerConnection(targetPeerId)
+			if (!pc) return
+			
+			// Add local stream if broadcasting
+			if (webrtcStreamRef.current) {
+				webrtcStreamRef.current.getTracks().forEach(track => {
+					pc.addTrack(track, webrtcStreamRef.current)
+				})
+			}
+			
+			// Create offer
+			const offer = await pc.createOffer()
+			await pc.setLocalDescription(offer)
+			
+			sendSignalingMessage(targetPeerId, {
+				type: 'offer',
+				sdp: offer.sdp
+			})
+			
+			console.log('[WEBRTC] Offer sent to', targetPeerId)
+		} catch (e) {
+			console.error('[WEBRTC] Failed to initiate connection', e)
+		}
+	}
+
+	// Setup remote playback pipeline (MediaSource)
+	const setupMediaSource = useCallback((mt) => {
+		if (currentMimeTypeRef.current === mt && mediaSourceRef.current && sourceBufferRef.current) {
+			// Already set up for this mime, skip
+			return
+		}
+		console.log('[STREAM][MSE] setupMediaSource start mimeType=', mt)
+		if (!('MediaSource' in window)) {
+			showMsg('MediaSource API not supported in this browser', 'error')
+			return
+		}
+		
+		// Clean up existing MediaSource if mime changes
+		if (mediaSourceRef.current && currentMimeTypeRef.current !== mt) {
+			try {
+				if (mediaSourceRef.current.readyState === 'open') {
+					console.log('[STREAM][MSE] closing previous MediaSource for mime change')
+					// Avoid endOfStream; just let old object be GC'd after detaching
+				}
+			} catch (e) { /* ignore */ }
+		}
+		
+		if (videoRemoteRef.current && videoRemoteRef.current.src) {
+			try {
+				URL.revokeObjectURL(videoRemoteRef.current.src)
+			} catch (e) { /* ignore */ }
+		}
+		
+		const ms = new MediaSource()
+		mediaSourceRef.current = ms
+		currentMimeTypeRef.current = mt
+		videoRemoteRef.current.src = URL.createObjectURL(ms)
+		
+		console.log('[STREAM][MSE] MediaSource created, URL assigned to video element')
+		
+		// Add video element event listeners for debugging
+		const video = videoRemoteRef.current
+		video.addEventListener('loadstart', () => console.log('[VIDEO] loadstart'))
+		video.addEventListener('loadedmetadata', () => console.log('[VIDEO] loadedmetadata - duration:', video.duration, 'readyState:', video.readyState))
+		video.addEventListener('loadeddata', () => console.log('[VIDEO] loadeddata - readyState:', video.readyState))
+		video.addEventListener('canplay', () => console.log('[VIDEO] canplay - can start playing'))
+		video.addEventListener('canplaythrough', () => console.log('[VIDEO] canplaythrough - can play without interruption'))
+		video.addEventListener('play', () => console.log('[VIDEO] play event fired'))
+		video.addEventListener('playing', () => console.log('[VIDEO] playing - video is actually playing'))
+		video.addEventListener('pause', () => console.log('[VIDEO] pause'))
+		video.addEventListener('waiting', () => console.log('[VIDEO] waiting - waiting for data'))
+		video.addEventListener('stalled', () => console.log('[VIDEO] stalled - network stalled'))
+		video.addEventListener('error', (e) => console.error('[VIDEO] error:', e, video.error))
+		
+		ms.addEventListener('sourceopen', () => {
+			try {
+				// Double-check MediaSource is still valid
+				if (ms !== mediaSourceRef.current || ms.readyState !== 'open') {
+					console.warn('[STREAM][MSE] MediaSource state changed during sourceopen, aborting setup')
+					return
+				}
+				
+				const sb = ms.addSourceBuffer(mt)
+				console.log('[STREAM][MSE] SourceBuffer created with mimeType=', mt, 'mediaSource.readyState=', ms.readyState)
+				
+				// detailed SB event logging
+				sb.addEventListener('error', (ev) => console.error('[STREAM][MSE] SourceBuffer ERROR', ev))
+				sb.addEventListener('abort', (ev) => console.warn('[STREAM][MSE] SourceBuffer ABORT', ev))
+				sb.addEventListener('update', () => { if (debugLogRef.current) console.log('[STREAM][MSE] SourceBuffer update') })
+				
+				sourceBufferRef.current = sb
+				sb.mode = 'sequence'
+				sb.addEventListener('updateend', handleUpdateEnd)
+				
+				// flush early buffers
+				if (earlyBuffersRef.current.length) {
+					console.log('[STREAM][MSE] appending early buffers count=', earlyBuffersRef.current.length)
+					while (earlyBuffersRef.current.length) {
+						const buf = earlyBuffersRef.current.shift()
+						try {
+							if (!sb.updating && ms.readyState === 'open' && Array.from(ms.sourceBuffers).includes(sb)) {
+								sb.appendBuffer(buf)
+								if (debugLogRef.current) console.log('[STREAM][MSE] appended early buffer size=', (buf && buf.byteLength) || (buf && buf.length))
+							} else {
+								pendingBuffersRef.current.push(buf)
+							}
+						} catch (e) { 
+							console.error('[STREAM][MSE] append early buffer failed', e)
+							pendingBuffersRef.current.push(buf)
+						}
+					}
+				}
+				console.log('[STREAM][MSE] flushed early buffers, pending:', pendingBuffersRef.current.length)
+			} catch (err) {
+				console.error('SourceBuffer error', err)
+				showMsg('Failed to init SourceBuffer', 'error')
+			}
+		})
+
+		// Watchdog: if no SourceBuffer after 1s, retry with fallback mime types
+		setTimeout(() => {
+			if (!sourceBufferRef.current && mediaSourceRef.current === ms) {
+				console.warn('[STREAM][MSE][WATCHDOG] SourceBuffer not created yet; retrying with fallback')
+				let fallbacks = [
+					'video/webm;codecs=vp8,opus',
+					'video/webm;codecs=vp8',
+					'video/webm'
+				]
+				const next = fallbacks.find(f => f !== mt && MediaSource.isTypeSupported(f))
+				if (next) {
+					setupMediaSource(next)
+					// request a fresh init since we changed mimeType
+					requestInit('watchdog-fallback')
+				}
+			}
+		}, 1000)
+		
+		ms.addEventListener('sourceclose', () => {
+			console.log('[STREAM][MSE] MediaSource closed')
+			if (sourceBufferRef.current) {
+				sourceBufferRef.current = null
+			}
+		})
+		
+		ms.addEventListener('sourceended', () => {
+			console.log('[STREAM][MSE] MediaSource ended')
+		})
+		
+	}, [handleUpdateEnd, requestInit])
+
 
   const startBroadcast = async () => {
     const lp = await ensureLibp2p();
@@ -578,7 +1109,7 @@ function StreamPage() {
   	// Subscription logic
 	const subscribe = useCallback(async () => {
 		console.log('[STREAM][DEBUG] Subscribe button clicked')
-		let lp = libp2pState;
+    let lp = libp2pState;
 		console.log('[STREAM][DEBUG] libp2pState:', lp ? 'exists' : 'null/undefined')
 		console.log('[STREAM][DEBUG] subscribed:', subscribed)
 		console.log('[STREAM][DEBUG] topicName:', topicName)
@@ -810,129 +1341,6 @@ function StreamPage() {
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [])
 
-  // Reset MediaSource pipeline when SourceBuffer becomes invalid
-	const resetMediaSourcePipeline = useCallback(() => {
-		try {
-			console.log('[STREAM][RESET] Resetting MediaSource pipeline')
-			
-			// Clear timeouts
-			if (mediaSourceResetTimeoutRef.current) {
-				clearTimeout(mediaSourceResetTimeoutRef.current)
-				mediaSourceResetTimeoutRef.current = null
-			}
-			
-			// Store current pending buffers to early buffers
-			if (pendingBuffersRef.current.length > 0) {
-				earlyBuffersRef.current.push(...pendingBuffersRef.current)
-				pendingBuffersRef.current = []
-			}
-			
-			// Clean up current MediaSource
-			if (sourceBufferRef.current) {
-				sourceBufferRef.current = null
-			}
-			
-			if (mediaSourceRef.current) {
-				try {
-					if (mediaSourceRef.current.readyState === 'open') {
-						console.log('[STREAM][RESET] (skip endOfStream to avoid premature close)')
-						// intentionally NOT calling endOfStream here to prevent auto-closing during active playback
-					}
-				} catch (e) { /* ignore */ }
-				mediaSourceRef.current = null
-			}
-			
-			if (videoRemoteRef.current) {
-				try {
-					URL.revokeObjectURL(videoRemoteRef.current.src)
-					videoRemoteRef.current.src = ''
-				} catch (e) { /* ignore */ }
-			}
-			
-			// Reset flags
-			firstRemoteFrameRef.current = false
-			
-			// Re-setup MediaSource if we have a mimeType
-			if (mimeType) {
-				setTimeout(() => {
-					console.log('[STREAM][RESET] Re-setting up MediaSource after reset')
-					if (!('MediaSource' in window)) {
-						console.error('[STREAM][RESET] MediaSource API not supported')
-						return
-					}
-					
-					const ms = new MediaSource()
-					mediaSourceRef.current = ms
-					videoRemoteRef.current.src = URL.createObjectURL(ms)
-					
-					ms.addEventListener('sourceopen', () => {
-						try {
-							if (ms !== mediaSourceRef.current || ms.readyState !== 'open') {
-								console.warn('[STREAM][RESET] MediaSource state changed during reset sourceopen')
-								return
-							}
-							
-							const sb = ms.addSourceBuffer(mimeType)
-							console.log('[STREAM][RESET] SourceBuffer recreated with mimeType=', mimeType)
-							
-							sourceBufferRef.current = sb
-							sb.mode = 'sequence'
-							
-							// Re-attach event listeners
-							sb.addEventListener('updateend', () => {
-								const currentSb = sourceBufferRef.current
-								const currentMs = mediaSourceRef.current
-								
-								if (!currentSb || !currentMs || currentMs.readyState !== 'open' || !Array.from(currentMs.sourceBuffers).includes(currentSb)) {
-									return
-								}
-								
-								if (pendingBuffersRef.current.length > 0 && !currentSb.updating) {
-									const next = pendingBuffersRef.current.shift()
-									if (next) {
-										try {
-											currentSb.appendBuffer(next)
-										} catch (e) {
-											console.error('[STREAM][RESET UPDATEEND] Failed to append buffer', e)
-										}
-									}
-								}
-								
-								if (!firstRemoteFrameRef.current && videoRemoteRef.current && videoRemoteRef.current.readyState >= 2) {
-									firstRemoteFrameRef.current = true
-									videoRemoteRef.current.play().catch(()=>{})
-								}
-							})
-							
-							// Process early buffers
-							if (earlyBuffersRef.current.length) {
-								console.log('[STREAM][RESET] Processing early buffers count=', earlyBuffersRef.current.length)
-								while (earlyBuffersRef.current.length) {
-									const buf = earlyBuffersRef.current.shift()
-									try {
-										if (!sb.updating && ms.readyState === 'open') {
-											sb.appendBuffer(buf)
-										} else {
-											pendingBuffersRef.current.push(buf)
-										}
-									} catch (e) { 
-										console.error('[STREAM][RESET] Failed to append early buffer', e)
-										pendingBuffersRef.current.push(buf)
-									}
-								}
-							}
-						} catch (err) {
-							console.error('[STREAM][RESET] Error setting up reset SourceBuffer', err)
-						}
-					})
-				}, 100)
-			}
-			
-		} catch (e) {
-			console.error('[STREAM][RESET] Error during MediaSource reset', e)
-		}
-	}, [mimeType])
-
 
 	const unsubscribe = useCallback(async () => {
 		console.log(`[STREAM] Unsubscribing from topic: ${topicName}`)
@@ -1034,6 +1442,27 @@ function StreamPage() {
 										) : (
 											<button variant="outlined" color="warning" onClick={unsubscribe}>Leave</button>
 										)}
+
+
+          											<video
+												ref={videoRemoteRef}
+												autoPlay
+												playsInline
+												muted={remoteMuted}
+												controls={!broadcasting && subscribed}
+												style={{ width: '100%', borderRadius: 8, background: '#000' }}
+											/>
+											{subscribed && (
+												<button size="small" sx={{ mt: 1 }} variant="outlined" onClick={() => {
+													setRemoteMuted(m => !m)
+													if (videoRemoteRef.current) {
+														videoRemoteRef.current.muted = !remoteMuted
+														videoRemoteRef.current.play().catch(()=>{})
+													}
+												}}>
+													{remoteMuted ? 'Unmute' : 'Mute'}
+												</button>
+											)}
       </div>
     </>
   );
