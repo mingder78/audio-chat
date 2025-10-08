@@ -63,7 +63,7 @@ function Dialer() {
        <p>Remote Peer:🍔 {remotePeer}</p>
 
 
-       <button onClick={handleSubmit}>get cyberfly-node-ui peer</button>
+       <button onClick={handleSubmit}>get the bootstrap node</button>
 
       {/* Error Message */}
       {error && <p style={{ color: 'red' }}>{error}</p>}
