@@ -60,38 +60,13 @@ function Dialer() {
 
   return (
     <div className="App">
-       <p>Remote Peer: {remotePeer}</p>
-      <h1>Submit Form and Display List</h1>
+       <p>Remote Peer:🍔 {remotePeer}</p>
 
-      {/* Form */}
-      <form onSubmit={handleSubmit}>
-        <label>
-          Name:
-          <input
-            type="text"
-            name="name"
-            value={formData.name}
-            onChange={handleInputChange}
-            required
-          />
-        </label>
-        <button type="submit">Submit</button>
-      </form>
+
+       <button onClick={handleSubmit}>get cyberfly-node-ui peer</button>
 
       {/* Error Message */}
       {error && <p style={{ color: 'red' }}>{error}</p>}
-
-      {/* Display List */}
-      <h2>Submitted Items</h2>
-      {items.length === 0 ? (
-        <p>No items submitted yet.</p>
-      ) : (
-        <ul>
-          {items.map((item) => (
-            <li key={item.id}>{item.name}</li>
-          ))}
-        </ul>
-      )}
     </div>
   );
 }
