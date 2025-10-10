@@ -2,7 +2,9 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { startLibp2pNode } from "../services/libp2p-services";
 import { useLibp2p } from "../contexts/Libp2pContext";
 import "../App.css";
-import { Switch } from "@headlessui/react";
+import { multiaddr } from '@multiformats/multiaddr'
+import { dialNode, findPeer } from '../services/node-services'
+
 // we send raw binary frames over the protocol; no base64 conversion needed
 const base64ToBuf = (b64) => {
   try {
@@ -54,7 +56,7 @@ const RTC_CONFIG = {
 function StreamPage() {
   const [localPeer, setLocalPeer] = useState("");
   const [channel, setChannel] = useState("main");
-  const topicName = `${STREAM_TOPIC_PREFIX}${channel}`; // Add topicName definition
+  const topicName = `${STREAM_TOPIC_PREFIX}${channel}`; // Add topicName definition cyberfly._peer-discovery._p2p._pubsub
   const [broadcasting, setBroadcasting] = useState(false);
   const [subscribed, setSubscribed] = useState(false);
 
@@ -596,6 +598,7 @@ function StreamPage() {
 
       // Handle ICE candidates
       pc.onicecandidate = (event) => {
+        console.log('handing pc on ice and date', event)
         if (event.candidate) {
           sendSignalingMessage(peerId, {
             type: "ice-candidate",
@@ -620,6 +623,8 @@ function StreamPage() {
   };
 
   const sendSignalingMessage = (peerId, message) => {
+    conosle.log('🚀🔭🛰📡🌈peerId', peerId)
+		console.log('🚀🔭🛰📡🌈message'. message)
     try {
       const lp = libp2pState;
       if (!lp) return;
@@ -685,7 +690,7 @@ function StreamPage() {
   // Add initiateWebRTCConnection function
   const initiateWebRTCConnection = async (targetPeerId) => {
     try {
-      console.log("[WEBRTC] Initiating connection to", targetPeerId);
+      console.log("🌄❤️ [WEBRTC] Initiating connection to", targetPeerId);
       const pc = await createPeerConnection(targetPeerId);
       if (!pc) return;
 
@@ -934,6 +939,19 @@ function StreamPage() {
               .map((c) => c.remotePeer.toString());
             console.log(connectedIds);
             console.log("⚡🌙 🌄❤️ reconnect to bootstrap");
+             const target = manualPeerId.trim();
+    if (!target) {
+      setManualConnectMsg("Enter peer id");
+      return;
+    }
+            const xpeer = '/dns4/node.cyberfly.io/tcp/31002/wss/p2p/'+target
+            const connected2 = await lp.dial(multiaddr(xpeer));
+            console.log(xpeer);
+            console.log(connected2);
+            const connectedIds2 = lp
+              .getConnections()
+              .map((c) => c.remotePeer.toString());
+            console.log(connectedIds2);
           } catch (e) {
             console.warn("Bootstrap dial attempt failed", e);
           }
@@ -1026,7 +1044,7 @@ function StreamPage() {
       try {
         if (!lp.services.pubsub.getTopics().includes(topicName)) {
           console.log(
-            "[STREAM][BROADCAST] self-subscribing to topic before publish"
+            "[🇹🇼STREAM][BROADCAST] self-subscribing to topic before publish"
           );
           // Some pubsub impls allow handler arg; we just call bare subscribe here
           await lp.services.pubsub.subscribe(topicName);
@@ -1063,12 +1081,15 @@ function StreamPage() {
 
       // Listen for request-init messages to re-broadcast init to late joiners
       const onMessage = (evt) => {
-        console.log("on message =======", evt);
+     console.log("on message =======", evt);
+     console.log('pub sub onMessage, evt', evt)
         const msgObj = evt.detail;
         if (!msgObj || msgObj.topic !== topicName) return;
         try {
+          console.log('on 🛰📡 message ⏳⚠️🧬🗳🖍💡⚙️🗝 ')
           const txt = new TextDecoder().decode(msgObj.data);
           const parsed = JSON.parse(txt);
+          console.log('on 🛰📡 message ⏳⚠️🧬🗳🖍💡⚙️🗝 ', parsed.type)
           if (parsed.type === "request-init") {
             // If we have an init segment available, include it as base64 so late joiners can start playback
             if (initSegmentRef.current) {
@@ -1108,7 +1129,7 @@ function StreamPage() {
       // When we produce chunks, push them to connected consumers over the protocol
 
       mr.ondataavailable = async (e) => {
-        console.log("rm.ondataaviable ======.>.>>>>>", e);
+        console.log(e.data.size)
         if (!e.data || e.data.size === 0) return;
         const arrayBuf = await e.data.arrayBuffer();
         const nextSeq = lastSeqRef.current + 1;
@@ -1139,6 +1160,7 @@ function StreamPage() {
               topicName,
               new TextEncoder().encode(JSON.stringify(enriched))
             );
+            console.log("rm.ondataaviable ======.>🎸🎹🎼 🎶>", enriched);
             if (debugLogRef.current)
               console.log(
                 "[STREAM][SEND INIT WITH B64] first segment bytes=",
@@ -1150,7 +1172,7 @@ function StreamPage() {
         }
         if (debugLogRef.current)
           console.log(
-            "[STREAM][SEND CHUNK PROTO] seq",
+            "[STREAM][SEND CHUNK 🎸🎸🎸🎸 PROTO] seq",
             nextSeq,
             "bytes",
             frame.length
@@ -1158,6 +1180,7 @@ function StreamPage() {
         // send to each consumer via their stream
         let protocolSent = false;
         for (const consumer of consumersRef.current || []) {
+          console.log("rm.ondataaviable =.>🎸🎹🎼 🎶>1111 no ", consumer)
           try {
             const lenBuf = new Uint8Array(4);
             new DataView(lenBuf.buffer).setUint32(0, frame.length, false);
@@ -1166,7 +1189,7 @@ function StreamPage() {
             consumer.push(frame);
             protocolSent = true;
           } catch (err) {
-            console.warn("[STREAM][PROTO SEND FAIL] consumer", err);
+            console.warn("🎸🎸🎸🎸🎸[STREAM][PROTO SEND FAIL] consumer", err);
           }
         }
         // Fallback: if no protocol consumers, also send via pubsub for immediate delivery
@@ -1371,6 +1394,20 @@ function StreamPage() {
       return;
     }
 
+          try {
+        if (!lp.services.pubsub.getTopics().includes(topicName)) {
+          console.log(
+            "[🇹🇼STREAM][BROADCAST] self-subscribing "
+          );
+          // Some pubsub impls allow handler arg; we just call bare subscribe here
+          await lp.services.pubsub.subscribe(topicName);
+        }
+      } catch (e) {
+        console.warn(
+          "[STREAM][BROADCAST] self subscribe failed (non fatal)",
+          e
+        );
+      }
     console.log(`[STREAM] Subscribing to topic: ${topicName}`);
 
     // Reset all state before starting
@@ -1386,12 +1423,14 @@ function StreamPage() {
     resetRecoveryState();
 
     const messageHandler = (msg) => {
-      console.log("msg ⏳⚠️🧬🗳🖍💡⚙️🗝", msg.detail);
       try {
         // Support different libp2p event shapes: direct handler (msg.data) or event.detail
         let raw = msg;
         if (msg && msg.detail) raw = msg.detail;
         // Filter by topic if present
+        // TODO if (raw.topic && raw.topic !== topicName) return;
+        console.log('raw.topic',raw.topic)
+        if (raw.topic === topicName) console.log('  👉💩	💎🦎 ⚒⚒ 🍔💖💨  777')
         if (raw.topic && raw.topic !== topicName) return;
         // Some implementations wrap data as { data: Uint8Array }
         const dataBytes = raw.data?.data ? raw.data.data : raw.data;
@@ -1404,7 +1443,7 @@ function StreamPage() {
           return;
         }
         if (!parsedMsg || !parsedMsg.type) return;
-        console.log("parsedMsg ⏳⚠️🧬🗳🖍💡⚙️🗝", parsedMsg);
+        console.log("messageHandler -. parsedMsg ⏳⚠️🧬🗳🖍💡⚙️🗝", parsedMsg.type);
         if (debugLogRef.current && parsedMsg.type !== "hb") {
           console.log(
             "[STREAM][RECV]",
@@ -1427,8 +1466,12 @@ function StreamPage() {
                 "[STREAM][INIT] Ignoring duplicate init for same mimeType"
               );
           }
-          // Attempt to dial broadcaster over direct protocol for efficient streaming
+          console.log('----------- Attempt to dial broadcaster over direct protocol for efficient streaming')
+           console.log("messageHandler, msg ⏳⚠️🧬🗳🖍💡⚙️🗝", msg);
           try {
+            console.log('parsedMsg.from',parsedMsg.from)
+            console.log('libp2pState',libp2pState)
+            console.log('videoProtocolPeersRef.current',videoProtocolPeersRef.current)
             if (
               parsedMsg.from &&
               libp2pState &&
@@ -1602,7 +1645,7 @@ function StreamPage() {
         lp.services.pubsub.subscribe.length >= 2
       ) {
         console.log(
-          "🙋‍♀️🙋🙋🏻‍♂👷[STREAM][SUBSCRIBE] using handler argument form"
+          "🙋‍♀️🙋🙋🏻‍♂👷[🇹🇼🇹🇼🇹🇼 STREAM][SUBSCRIBE] using handler argument form"
         );
         await lp.services.pubsub.subscribe(topicName, messageHandler);
         usedDirectHandler = true;
@@ -1613,7 +1656,7 @@ function StreamPage() {
         e
       );
     }
-    console.log("----------------", usedDirectHandler);
+    console.log("--------🇹🇼🇹🇼🇹🇼--------", usedDirectHandler);
     if (!usedDirectHandler) {
       // Fallback to event listener pattern
       lp.services.pubsub.removeEventListener("message", messageHandler);
@@ -1835,6 +1878,7 @@ function StreamPage() {
     }
   }, [libp2pState, libp2pInitializing, ensureLibp2p]); // Only run once on mount
 
+      
   const connectToManualPeer = async () => {
     setManualConnectMsg("");
     const target = manualPeerId.trim();
@@ -1909,7 +1953,7 @@ function StreamPage() {
   return (
     <>
       <div>
-        <h2>Enter peer address to connect</h2>
+        <h2>Enter listener peer address to connect</h2>
         <input
           type="text"
           value={manualPeerId}
