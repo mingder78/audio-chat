@@ -17,6 +17,7 @@
     "@emotion/react": "^11.11.4",
     "@emotion/styled": "^11.11.5",
     "@eslint/js": "^9.36.0",
+    "@headlessui/react": "^2.2.9",
     "@helia/unixfs": "^4.0.1",
     "@kadena/client": "^1.15.0",
     "@kadena/cryptography-utils": "^0.4.4",
