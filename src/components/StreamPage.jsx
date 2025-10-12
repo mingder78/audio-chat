@@ -3,7 +3,6 @@ import { startLibp2pNode } from "../services/libp2p-services";
 import { useLibp2p } from "../contexts/Libp2pContext";
 import "../App.css";
 import { multiaddr } from '@multiformats/multiaddr'
-import { dialNode, findPeer } from '../services/node-services'
 
 // we send raw binary frames over the protocol; no base64 conversion needed
 const base64ToBuf = (b64) => {
