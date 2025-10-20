@@ -622,7 +622,7 @@ function StreamPage() {
   };
 
   const sendSignalingMessage = (peerId, message) => {
-    conosle.log('🚀🔭🛰📡🌈peerId', peerId)
+    console.log('🚀🔭🛰📡🌈peerId', peerId)
 		console.log('🚀🔭🛰📡🌈message'. message)
     try {
       const lp = libp2pState;
